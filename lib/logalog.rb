@@ -48,23 +48,22 @@ module Logalog
   end
   
   class Callback
-    def initialize(block_or_method_name, receiver=nil)
+    def initialize(block_or_method_name)
       if block_or_method_name.is_a? Proc
         @block = block_or_method_name
       else
         @method = block_or_method_name
-        @receiver = receiver
       end
     end
     
-    def call(*args)
+    def call(receiver, *args)
       if @block
         @block.call(*args)
-      elsif @method && @receiver
-        if @receiver.methods.include? @method
-          @receiver.send @method, *args
-        elsif @receiver.class.methods.include? @method
-          @receiver.class.send @method, *args
+      elsif @method
+        if receiver.methods.include? @method
+          receiver.send @method, *args
+        elsif receiver.class.methods.include? @method
+          receiver.class.send @method, *args
         end
       end
     end
@@ -107,15 +106,15 @@ module Logalog
     end
     
     def before(callback=nil, &block)
-      @before_callbacks << Callback.new(callback || block, @receiver)
+      @before_callbacks << Callback.new(callback || block)
     end
     
     def after(callback=nil, &block)
-      @after_callbacks << Callback.new(callback || block, @receiver)
+      @after_callbacks << Callback.new(callback || block)
     end
     
     def on_exception(callback=nil, &block)
-      @on_exception_callbacks << Callback.new(callback || block, @receiver)
+      @on_exception_callbacks << Callback.new(callback || block)
     end
     
     def call receiver, args, &block
@@ -167,19 +166,30 @@ module Logalog
     
     def do_callbacks(callbacks, receiver, args, block, params={})
       callbacks.each do |cb|
-        cb.call build_callback_params(receiver, @method, args, block, params)
+        cb.call receiver, build_callback_params(receiver, @method, args, block, params)
       end
     end
     
+    module HashInitializable
+      def initialize(attrs={})
+        attrs.each_pair { |k, v| send("#{k}=", v) }
+      end
+    end
+    
+    class Call
+      include HashInitializable
+      attr_accessor :receiver, :method, :args, :block, :exception, :return_value
+    end
+    
     def build_callback_params(receiver, method, args, block, params={})
-      { :receiver     => receiver,
-        :method       => method,
-        :args         => args,
-        :arguments    => args,
-        :block        => block,
-        :exception    => nil,
+      Call.new({
+        :receiver => receiver,
+        :method => method,
+        :args => args,
+        :block => block,
+        :exception => nil,
         :return_value => nil,
-      }.merge(params)
+      }.merge(params))
     end
   end
   
@@ -215,13 +225,14 @@ module Logalog
       #     end
       #
       # Callback methods should accept a single argument, a hash containing
-      # information about the method that triggered the callback. For example:
+      # information about the method call that triggered the callback.
+      # For example:
       #
-      #     def log_before_my_method(params)
-      #       params[:method]    # => :my_method
-      #       params[:receiver]  # => an instance of this class
-      #       params[:arguments] # => args passed to my_method
-      #       params[:block]     # => block passed to my_method
+      #     def log_before_my_method(call)
+      #       call.method    # => :my_method
+      #       call.receiver  # => an instance of this class
+      #       call.args      # => args passed to my_method
+      #       call.block     # => block passed to my_method
       #     end
       #
       # Callback methods may be defined as instance methods or class methods.
@@ -230,11 +241,15 @@ module Logalog
       # NoMethodError.
       #
       # It is possible to use Logalog without defining any callbacks yourself.
-      # You can call logalog with no block to use the default callbacks. If you
-      # take this route you should specify a logger and method for Logalog to use.
       #
       #     logalog_use_logger Rails.logger, :info
       #     logalog :my_method  # use default logging
+      #
+      # The above will use the default Logalog callbacks, using the logger you
+      # specify to write output.
+      #
+      # You can implement your own defaults by overriding the
+      # `logalog_default_*_callback` methods on your class.
       #
       # # TODO: clients can specify a different logger/method for each callback
       
@@ -249,10 +264,62 @@ module Logalog
         method_interceptor =
             _logalog_find_or_create_method_interceptor(method, method_type)
         
-        yield method_interceptor
+        if block_given?
+          yield method_interceptor
+        else
+          _logalog_add_default_callbacks(method_interceptor)
+        end
         
         @_logalog_method_interceptors[method_type][method] = method_interceptor
       end
+    end
+    
+    def logalog_default_before_callback(call)
+      caller = Kernel.caller
+      stack_depth = caller.length
+      max_indent = 20
+      indent_string = if stack_depth > max_indent
+        "[logalog] #{(stack_depth).to_s.ljust(4)}" + ">" + " "*(stack_depth % max_indent)
+      else
+        " "*5 + ">" + " "*stack_depth
+      end
+      
+      c = caller[6].to_s.gsub(/^.*\//, '')
+      s = "#{indent_string}#{c} called #{call.receiver}.#{call.method}(#{call.args})"
+      
+      #_logalog_default_log(:before, s)
+      puts s
+    end
+    
+    def logalog_default_after_callback(call)
+      stack_depth = Kernel.caller.length
+      max_indent = 20
+      indent_string = if stack_depth > max_indent
+        "[logalog] #{(stack_depth).to_s.ljust(4)}" + "|" + " "*(stack_depth % max_indent)
+      else
+        " "*5 + "|" + " "*stack_depth
+      end
+      
+      s = "#{indent_string}#{call.receiver}.#{call.method}(#{call.args}) => #{call.return_value}"
+      
+      #_logalog_default_log(:before, s)
+      puts s
+    end
+    
+    def logalog_default_on_exception_callback(call)
+      caller = Kernel.caller
+      stack_depth = caller.length
+      max_indent = 20
+      indent_string = if stack_depth > max_indent
+        "[logalog] #{(stack_depth).to_s.ljust(4)}" + "|" + " "*(stack_depth % max_indent)
+      else
+        " "*5 + "#" + " "*stack_depth
+      end
+      
+      s = "#{indent_string}#{call.receiver}.#{call.method}(#{call.args}) raised #{call.exception}"
+      
+      #_logalog_default_log(:before, s)
+      puts s
     end
     
     def _logalog_find_or_create_method_interceptor(method, method_type)
@@ -266,126 +333,11 @@ module Logalog
         @_logalog_method_interceptors = {CLASS_METHOD => {}, INSTANCE_METHOD => {}}
       end
     end
-  end
-end
-
-
-
-
-
-
-
-
-
-
-
-class Bank
-  include Logalog
-  
-  def initialize
-    @bank_accounts = []
-  end
-  
-  def register_account(account)
-    @bank_accounts << account
-  end
-  
-  def transfer(src_account_nbr, dest_account_nbr, amount)
-    src =  @bank_accounts.select { |b| b.account_number == src_account_nbr  }.first
-    dest = @bank_accounts.select { |b| b.account_number == dest_account_nbr }.first
-    src.debit(amount)
-    dest.credit(amount)
-    amount
-  end
-  
-  logalog 'self.new', 'register_account', 'transfer' do |method|
-    method.before { |params| puts "calling #{params[:method]} on #{params[:receiver]} with #{params[:args]}" }
-    method.after  { |params| puts "returned #{params[:return_value].inspect} from #{params[:method]} on #{params[:receiver]}" }
-  end
-  
-  logalog 'transfer' do |method|
-    method.on_exception { puts "transfer raised exception!" }
-  end
-  
-  logalog 'self.new' do |method|
-    method.before { puts "initializing new bank account" }
-    method.after  { puts "initialized!" }
-  end
-end
-
-class BankAccount
-  include Logalog
-  
-  @@last_account_number = 0
-  
-  attr_accessor :account_number, :balance
-  
-  def initialize initial_balance = 0
-    self.account_number = @@last_account_number + 1
-    @@last_account_number = account_number
     
-    self.balance = initial_balance
-  end
-  
-  def credit(amount)
-    self.balance += amount
-  end
-  
-  def debit(amount)
-    if self.balance >= amount
-      self.balance -= amount
-    else
-      raise 'insufficient funds'
+    def _logalog_add_default_callbacks(method_interceptor)
+      method_interceptor.before :logalog_default_before_callback
+      method_interceptor.after  :logalog_default_after_callback
+      method_interceptor.on_exception :logalog_default_on_exception_callback
     end
   end
-  
-  def instance_cb
-    puts "instance callback on #{self}"
-  end
-  
-  def self.boogie
-    puts "OH YEAH"
-  end
-  
-  def self.bill_and_ted
-    puts "Most excellent!!!"
-  end
-  
-  logalog 'self.boogie' do |method|
-    method.before { |p| puts ">>> #{p[:receiver]} is about to boogie" }
-    method.after { |p| puts ">>> #{p[:receiver]} is done with boogie" }
-  end
-  
-  logalog 'self.bill_and_ted' do |method|
-    method.before { |p| puts ">>> ..." }
-    method.after { |p| puts ">>> !!!" }
-  end
-  
-  logalog :account_number=, :balance= do |method|
-    method.before :instance_cb
-    method.before { |params| puts "set #{params[:method]} #{params[:args].first}" }
-    method.after  { |params| puts "finished setting #{params[:method]} #{params[:args].first}" }
-  end
-  
-  logalog :initialize do |method|
-    method.before { |params| puts "initializing BankAccount with #{params[:args].inspect}" }
-  end 
 end
-
-puts "----- about to call Bank.new -----"
-bank = Bank.new
-
-puts "----- about to add bank accounts -----"
-b1 = BankAccount.new 100
-b2 = BankAccount.new 200
-
-bank.register_account b1
-bank.register_account b2
-
-puts "----- about to do a transfer -----"
-
-bank.transfer(1, 2, 50)
-
-puts "----- this transfer will fail -----"
-
-bank.transfer(1, 2, 1000)
